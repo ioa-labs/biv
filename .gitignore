@@ -1,0 +1,25 @@
+# Rust build output
+/target/
+
+# Codex/agent workspace metadata
+/.agents/
+/.codex/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and OS metadata
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local logs and crash dumps
+*.log
+core
+core.*
