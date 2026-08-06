@@ -31,6 +31,19 @@ cargo build --release
 target/release/better-image-view /path/to/image.jpg
 ```
 
+If [`just`](https://just.systems/) is installed, the project also provides short,
+repeatable commands for the usual options:
+
+```bash
+just build
+just run /path/to/image.jpg
+just debug-print /path/to/image.jpg
+just check
+just test
+```
+
+Run `just` without arguments to list all available recipes.
+
 Keys and controls:
 
 - Page Down, Space, or mouse wheel down: next image
