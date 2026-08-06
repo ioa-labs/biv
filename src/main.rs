@@ -2276,14 +2276,52 @@ fn sibling_images(initial_path: &Path) -> Result<Vec<PathBuf>, String> {
         .filter(|path| path.is_file() && is_supported_image(path))
         .collect();
     paths.sort_by_cached_key(|path| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().to_lowercase())
-            .unwrap_or_default()
+        natural_sort_key(
+            &path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default(),
+        )
     });
     if paths.is_empty() {
         return Err(format!("no supported images in {}", parent.display()));
     }
     Ok(paths)
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum NaturalChunk {
+    // Digit runs with leading zeros stripped: comparing stripped length first
+    // and then the digit string orders runs by numeric value without a parse
+    // that could overflow.
+    Number(usize, String),
+    Text(String),
+}
+
+/// Sort key matching file managers' natural order: case-insensitive, with
+/// digit runs compared as numbers so "img_9" sorts before "img_10". The full
+/// name tiebreaks entries whose chunks compare equal ("img01" vs "img1").
+fn natural_sort_key(name: &str) -> (Vec<NaturalChunk>, String) {
+    let lower = name.to_lowercase();
+    let mut chunks = Vec::new();
+    let mut rest = lower.as_str();
+    while !rest.is_empty() {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let (run, tail) = if digits > 0 {
+            let (run, tail) = rest.split_at(digits);
+            let run = run.trim_start_matches('0');
+            (NaturalChunk::Number(run.len(), run.to_string()), tail)
+        } else {
+            let end = rest
+                .find(|c: char| c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            let (run, tail) = rest.split_at(end);
+            (NaturalChunk::Text(run.to_string()), tail)
+        };
+        chunks.push(run);
+        rest = tail;
+    }
+    (chunks, name.to_string())
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -2413,8 +2451,32 @@ mod tests {
     }
 
     #[test]
+    fn sorts_folder_listing_naturally() {
+        let mut names = vec![
+            "IMG_10.jpg",
+            "img_9.jpg",
+            "IMG_2.jpg",
+            "img_01.jpg",
+            "img_1.jpg",
+            "cover.png",
+        ];
+        names.sort_by_cached_key(|name| natural_sort_key(name));
+        assert_eq!(
+            names,
+            vec![
+                "cover.png",
+                "img_01.jpg",
+                "img_1.jpg",
+                "IMG_2.jpg",
+                "img_9.jpg",
+                "IMG_10.jpg",
+            ]
+        );
+    }
+
+    #[test]
     fn discovers_and_decodes_the_sample_image() {
-        let sample = PathBuf::from("test/girl_bookshelf.PNG")
+        let sample = PathBuf::from("test/flower.jpg")
             .canonicalize()
             .expect("sample image should exist");
         let paths = sibling_images(&sample).expect("sample directory should be readable");
