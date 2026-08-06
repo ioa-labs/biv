@@ -1,4 +1,5 @@
-default:
+# List available recipes
+help:
     @just --list
 
 # Build the optimized executable
