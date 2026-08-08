@@ -69,6 +69,13 @@ fn default_zoom(view_width: i32, view_height: i32, image_width: i32, image_heigh
         .min(1.0)
 }
 
+fn scaled_image_size(image_width: i32, image_height: i32, zoom: f64) -> (f32, f32) {
+    (
+        image_width as f32 * zoom as f32,
+        image_height as f32 * zoom as f32,
+    )
+}
+
 mod canvas_imp {
     use super::*;
 
@@ -113,20 +120,21 @@ mod canvas_imp {
             let widget = self.obj();
             let available_width = widget.width() as f32;
             let available_height = widget.height() as f32;
-            let (width, height) = if self.zoom.get() <= 0.0 {
-                let zoom = default_zoom(
+            let zoom = if self.zoom.get() <= 0.0 {
+                default_zoom(
                     widget.width(),
                     widget.height(),
                     texture.width(),
                     texture.height(),
-                ) as f32;
-                (
-                    texture.width() as f32 * zoom,
-                    texture.height() as f32 * zoom,
                 )
             } else {
-                (available_width, available_height)
+                self.zoom.get()
             };
+            // The scrolled window can briefly allocate the two axes at different
+            // points during relayout. Never use that allocation as the image's
+            // draw size: one zoom factor must govern both axes so the texture
+            // cannot stretch while zooming.
+            let (width, height) = scaled_image_size(texture.width(), texture.height(), zoom);
             let bounds = gtk::graphene::Rect::new(
                 (available_width - width) / 2.0,
                 (available_height - height) / 2.0,
@@ -2375,6 +2383,12 @@ mod tests {
     fn default_zoom_shrinks_large_images_to_fit() {
         assert_eq!(default_zoom(1200, 800, 2400, 1200), 0.5);
         assert_eq!(default_zoom(1200, 800, 1200, 1600), 0.5);
+    }
+
+    #[test]
+    fn scaled_image_size_preserves_aspect_ratio() {
+        let (width, height) = scaled_image_size(1600, 900, 1.25);
+        assert!((width / height - 1600.0 / 900.0).abs() < 0.0001);
     }
 
     #[test]
