@@ -68,6 +68,9 @@ Enlargement uses nearest-neighbor filtering so individual pixels remain crisp.
 Fit-to-window and reduction use smooth filtering.
 By default, small images remain at their natural size while oversized images shrink
 to fit the viewport.
+Zoom percentages are relative to the original image dimensions: 100% means one source
+pixel per screen pixel. Zooming uses a ladder of clean percentages and includes the
+exact fit-to-window percentage between its neighboring steps.
 
 Quick Edit is non-destructive. Rotation previews use the already decoded display image;
 Save Copy applies the selected rotation and maximum-edge downsize to the full-resolution

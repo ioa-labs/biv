@@ -18,7 +18,10 @@ const APP_ID: &str = "dev.aethera.BetterImageView";
 const DEFAULT_CACHE_MB: usize = 512;
 const DECODE_WIDTH: i32 = 2560;
 const DECODE_HEIGHT: i32 = 1600;
-const ZOOM_STEP: f64 = 1.25;
+const ZOOM_LEVELS: &[f64] = &[
+    0.125, 0.167, 0.25, 0.333, 0.5, 0.667, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0,
+    10.0, 12.0, 16.0, 20.0, 24.0, 32.0,
+];
 const PRINT_MARGIN_MM: f64 = 12.0;
 #[cfg(any())]
 const PRINT_RASTER_DPI: f64 = 300.0;
@@ -76,6 +79,35 @@ fn scaled_image_size(image_width: i32, image_height: i32, zoom: f64) -> (f32, f3
     )
 }
 
+fn next_zoom_level(current: f64) -> f64 {
+    ZOOM_LEVELS
+        .iter()
+        .copied()
+        .find(|level| *level > current + f64::EPSILON)
+        .unwrap_or(*ZOOM_LEVELS.last().expect("zoom levels must not be empty"))
+}
+
+fn previous_zoom_level(current: f64, fit: f64) -> Option<f64> {
+    let previous = ZOOM_LEVELS
+        .iter()
+        .rev()
+        .copied()
+        .find(|level| *level < current - f64::EPSILON);
+    match previous {
+        Some(level) if level > fit => Some(level),
+        _ => None,
+    }
+}
+
+fn format_zoom(zoom: f64) -> String {
+    let percentage = zoom * 100.0;
+    if (percentage - percentage.round()).abs() < 0.01 {
+        format!("{percentage:.0}%")
+    } else {
+        format!("{percentage:.1}%")
+    }
+}
+
 mod canvas_imp {
     use super::*;
 
@@ -84,6 +116,9 @@ mod canvas_imp {
         pub texture: RefCell<Option<gdk::Texture>>,
         pub zoom: Cell<f64>,
         pub fit_zoom: Cell<f64>,
+        pub source_width: Cell<i32>,
+        pub source_height: Cell<i32>,
+        pub decoded_scale: Cell<f64>,
     }
 
     #[glib::object_subclass]
@@ -165,32 +200,41 @@ impl ImageCanvas {
             .build()
     }
 
-    fn set_texture(&self, texture: &impl IsA<gdk::Texture>) {
-        self.imp().texture.replace(Some(texture.as_ref().clone()));
+    fn set_texture(&self, texture: &impl IsA<gdk::Texture>, source_width: i32, source_height: i32) {
+        let texture = texture.as_ref();
+        self.imp().texture.replace(Some(texture.clone()));
         self.imp().zoom.set(0.0);
         self.imp().fit_zoom.set(0.0);
+        self.imp().source_width.set(source_width);
+        self.imp().source_height.set(source_height);
+        self.imp()
+            .decoded_scale
+            .set(texture.width() as f64 / source_width as f64);
         self.queue_resize();
         self.queue_draw();
     }
 
     fn zoom_in(&self) {
         let imp = self.imp();
-        let Some(texture) = imp.texture.borrow().as_ref().cloned() else {
+        if imp.texture.borrow().is_none() {
             return;
-        };
+        }
         let current = imp.zoom.get();
         let fit = default_zoom(
             self.width(),
             self.height(),
-            texture.width(),
-            texture.height(),
+            imp.source_width.get(),
+            imp.source_height.get(),
         );
-        imp.zoom.set(if current <= 0.0 {
+        let decoded_scale = imp.decoded_scale.get();
+        let current_source_zoom = current * decoded_scale;
+        let target = if current <= 0.0 {
             imp.fit_zoom.set(fit);
-            fit * ZOOM_STEP
+            next_zoom_level(fit)
         } else {
-            current * ZOOM_STEP
-        });
+            next_zoom_level(current_source_zoom)
+        };
+        imp.zoom.set(target / decoded_scale);
         self.queue_resize();
     }
 
@@ -200,9 +244,13 @@ impl ImageCanvas {
             return;
         }
         let fit = imp.fit_zoom.get();
-        let next = imp.zoom.get() / ZOOM_STEP;
-        imp.zoom
-            .set(if fit <= 0.0 || next <= fit { 0.0 } else { next });
+        let decoded_scale = imp.decoded_scale.get();
+        let current = imp.zoom.get() * decoded_scale;
+        imp.zoom.set(
+            previous_zoom_level(current, fit)
+                .map(|level| level / decoded_scale)
+                .unwrap_or(0.0),
+        );
         self.queue_resize();
     }
 
@@ -219,16 +267,16 @@ impl ImageCanvas {
     fn effective_zoom(&self) -> Option<f64> {
         let imp = self.imp();
         let texture = imp.texture.borrow();
-        let texture = texture.as_ref()?;
+        texture.as_ref()?;
         let zoom = imp.zoom.get();
         Some(if zoom > 0.0 {
-            zoom
+            zoom * imp.decoded_scale.get()
         } else {
             default_zoom(
                 self.width(),
                 self.height(),
-                texture.width(),
-                texture.height(),
+                imp.source_width.get(),
+                imp.source_height.get(),
             )
         })
     }
@@ -442,9 +490,9 @@ impl Viewer {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("image");
-        let zoom = self.canvas.effective_zoom().unwrap_or(1.0) * 100.0;
+        let zoom = format_zoom(self.canvas.effective_zoom().unwrap_or(1.0));
         self.info.set_text(&format!(
-            "{name}\n{} × {} · {} · {zoom:.0}%",
+            "{name}\n{} × {} · {} · {zoom}",
             frame.source_width, frame.source_height, frame.file_type
         ));
     }
@@ -638,8 +686,15 @@ impl Viewer {
     }
 
     fn present_frame(&self, frame: &DecodedFrame) {
-        let texture = texture_for_rotation(frame, self.edit_rotation.get());
-        self.canvas.set_texture(&texture);
+        let rotation = self.edit_rotation.get();
+        let texture = texture_for_rotation(frame, rotation);
+        let (source_width, source_height) = if rotation % 2 == 0 {
+            (frame.source_width, frame.source_height)
+        } else {
+            (frame.source_height, frame.source_width)
+        };
+        self.canvas
+            .set_texture(&texture, source_width, source_height);
         self.update_info();
         self.metadata.set_text(&frame.metadata);
         if self.edit_panel.reveals_child() {
@@ -2428,6 +2483,28 @@ mod tests {
     fn default_zoom_shrinks_large_images_to_fit() {
         assert_eq!(default_zoom(1200, 800, 2400, 1200), 0.5);
         assert_eq!(default_zoom(1200, 800, 1200, 1600), 0.5);
+    }
+
+    #[test]
+    fn zoom_steps_use_clean_source_relative_levels() {
+        assert_eq!(next_zoom_level(0.63), 0.667);
+        assert_eq!(next_zoom_level(0.75), 1.0);
+        assert_eq!(next_zoom_level(4.0), 5.0);
+        assert_eq!(next_zoom_level(32.0), 32.0);
+    }
+
+    #[test]
+    fn zooming_out_visits_fit_between_standard_levels() {
+        assert_eq!(previous_zoom_level(0.667, 0.63), None);
+        assert_eq!(previous_zoom_level(1.0, 0.63), Some(0.75));
+        assert_eq!(previous_zoom_level(2.0, 0.8), Some(1.5));
+    }
+
+    #[test]
+    fn zoom_percentage_keeps_useful_fractional_levels() {
+        assert_eq!(format_zoom(1.0), "100%");
+        assert_eq!(format_zoom(0.667), "66.7%");
+        assert_eq!(format_zoom(0.125), "12.5%");
     }
 
     #[test]
