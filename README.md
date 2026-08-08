@@ -54,7 +54,7 @@ Keys and controls:
 - `+` / `-`: zoom in / out
 - `0`: fit image to window
 - `F`: toggle fullscreen (the viewer starts fullscreen)
-- `I`: toggle a minimal filename, resolution, and file-type overlay
+- `I`: toggle a minimal filename, resolution, file-type, and current zoom overlay
 - `E`: toggle quick editing with rotate, downsize, and Save Copy
 - `P`: toggle the right-side metadata and EXIF panel
 - Ctrl+P: open the print dialog for the current source image

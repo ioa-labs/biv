@@ -216,6 +216,23 @@ impl ImageCanvas {
         self.imp().zoom.get() > 0.0
     }
 
+    fn effective_zoom(&self) -> Option<f64> {
+        let imp = self.imp();
+        let texture = imp.texture.borrow();
+        let texture = texture.as_ref()?;
+        let zoom = imp.zoom.get();
+        Some(if zoom > 0.0 {
+            zoom
+        } else {
+            default_zoom(
+                self.width(),
+                self.height(),
+                texture.width(),
+                texture.height(),
+            )
+        })
+    }
+
     fn texture(&self) -> Option<gdk::Texture> {
         self.imp().texture.borrow().clone()
     }
@@ -412,7 +429,39 @@ impl Viewer {
     }
 
     fn toggle_info(&self) {
+        self.update_info();
         self.info.set_visible(!self.info.is_visible());
+    }
+
+    fn update_info(&self) {
+        let Some(frame) = self.cache.frames.get(self.current_path()) else {
+            return;
+        };
+        let name = frame
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("image");
+        let zoom = self.canvas.effective_zoom().unwrap_or(1.0) * 100.0;
+        self.info.set_text(&format!(
+            "{name}\n{} × {} · {} · {zoom:.0}%",
+            frame.source_width, frame.source_height, frame.file_type
+        ));
+    }
+
+    fn zoom_in(&self) {
+        self.canvas.zoom_in();
+        self.update_info();
+    }
+
+    fn zoom_out(&self) {
+        self.canvas.zoom_out();
+        self.update_info();
+    }
+
+    fn zoom_fit(&self) {
+        self.canvas.zoom_fit();
+        self.update_info();
     }
 
     fn toggle_metadata(&self) {
@@ -591,15 +640,7 @@ impl Viewer {
     fn present_frame(&self, frame: &DecodedFrame) {
         let texture = texture_for_rotation(frame, self.edit_rotation.get());
         self.canvas.set_texture(&texture);
-        let name = frame
-            .path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("image");
-        self.info.set_text(&format!(
-            "{name}\n{} × {} · {}",
-            frame.source_width, frame.source_height, frame.file_type
-        ));
+        self.update_info();
         self.metadata.set_text(&frame.metadata);
         if self.edit_panel.reveals_child() {
             self.update_edit_dimensions(frame);
@@ -862,7 +903,7 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
         index,
         direction: 1,
         generation: 1,
-        canvas,
+        canvas: canvas.clone(),
         scroller,
         status,
         info,
@@ -877,6 +918,12 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
         loader_tx,
         skip_delete_confirmation: Cell::new(false),
     }));
+    for property in ["width", "height"] {
+        canvas.connect_notify_local(Some(property), {
+            let viewer = viewer.clone();
+            move |_, _| viewer.borrow().update_info()
+        });
+    }
     install_context_menu(viewer.clone());
     rotate_left.connect_clicked({
         let viewer = viewer.clone();
@@ -937,11 +984,9 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
                     let last = viewer.borrow().paths.len() - 1;
                     viewer.borrow_mut().move_to(last);
                 }
-                gdk::Key::plus | gdk::Key::KP_Add | gdk::Key::equal => {
-                    viewer.borrow().canvas.zoom_in()
-                }
-                gdk::Key::minus | gdk::Key::KP_Subtract => viewer.borrow().canvas.zoom_out(),
-                gdk::Key::_0 | gdk::Key::KP_0 => viewer.borrow().canvas.zoom_fit(),
+                gdk::Key::plus | gdk::Key::KP_Add | gdk::Key::equal => viewer.borrow().zoom_in(),
+                gdk::Key::minus | gdk::Key::KP_Subtract => viewer.borrow().zoom_out(),
+                gdk::Key::_0 | gdk::Key::KP_0 => viewer.borrow().zoom_fit(),
                 gdk::Key::f | gdk::Key::F => viewer.borrow().toggle_fullscreen(),
                 gdk::Key::i | gdk::Key::I => viewer.borrow().toggle_info(),
                 gdk::Key::e | gdk::Key::E => viewer.borrow().toggle_edit(),
