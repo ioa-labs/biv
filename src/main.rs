@@ -1013,6 +1013,9 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
     let space_held = Rc::new(Cell::new(false));
     let space_dragged = Rc::new(Cell::new(false));
     let keys = gtk::EventControllerKey::new();
+    // Capture Space before GtkScrolledWindow handles it as a scrolling key so
+    // it can act as the primary-button drag modifier.
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed({
         let viewer = viewer.clone();
         let app = app.clone();
