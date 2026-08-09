@@ -49,7 +49,7 @@ Keys and controls:
 - Page Down, Space, or mouse wheel down: next image
 - Page Up, Backspace, or mouse wheel up: previous image
 - Left / Right at default zoom: previous / next image
-- Arrow keys while zoomed in: pan the image
+- Arrow keys, Space+drag, or middle-mouse drag while zoomed in: pan the image
 - Home / End: first / last image
 - `+` / `-`: zoom in / out
 - `0`: fit image to window

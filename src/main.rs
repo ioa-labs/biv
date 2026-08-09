@@ -959,7 +959,7 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
         direction: 1,
         generation: 1,
         canvas: canvas.clone(),
-        scroller,
+        scroller: scroller.clone(),
         status,
         info,
         metadata,
@@ -1010,15 +1010,24 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
         move |_| request_save_copy(viewer.clone())
     });
 
+    let space_held = Rc::new(Cell::new(false));
+    let space_dragged = Rc::new(Cell::new(false));
     let keys = gtk::EventControllerKey::new();
     keys.connect_key_pressed({
         let viewer = viewer.clone();
         let app = app.clone();
+        let space_held = space_held.clone();
+        let space_dragged = space_dragged.clone();
         move |_, key, _, state| {
             let control = state.contains(gdk::ModifierType::CONTROL_MASK);
             match key {
                 gdk::Key::p | gdk::Key::P if control => viewer.borrow().print(),
-                gdk::Key::Page_Down | gdk::Key::space => viewer.borrow_mut().move_by(1),
+                gdk::Key::space => {
+                    if !space_held.replace(true) {
+                        space_dragged.set(false);
+                    }
+                }
+                gdk::Key::Page_Down => viewer.borrow_mut().move_by(1),
                 gdk::Key::Page_Up | gdk::Key::BackSpace => viewer.borrow_mut().move_by(-1),
                 gdk::Key::Right if viewer.borrow().canvas.is_zoomed() => {
                     viewer.borrow().pan_by(80.0, 0.0)
@@ -1054,7 +1063,72 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
             glib::Propagation::Stop
         }
     });
+    keys.connect_key_released({
+        let viewer = viewer.clone();
+        let space_held = space_held.clone();
+        let space_dragged = space_dragged.clone();
+        move |_, key, _, _| {
+            if key == gdk::Key::space && space_held.replace(false) && !space_dragged.get() {
+                viewer.borrow_mut().move_by(1);
+            }
+        }
+    });
     window.add_controller(keys);
+
+    let drag = gtk::GestureDrag::new();
+    drag.set_button(0);
+    let drag_active = Rc::new(Cell::new(false));
+    let drag_start_x = Rc::new(Cell::new(0.0));
+    let drag_start_y = Rc::new(Cell::new(0.0));
+    drag.connect_drag_begin({
+        let viewer = viewer.clone();
+        let space_held = space_held.clone();
+        let drag_active = drag_active.clone();
+        let drag_start_x = drag_start_x.clone();
+        let drag_start_y = drag_start_y.clone();
+        move |gesture, _, _| {
+            let allowed = gesture.current_button() == gdk::BUTTON_MIDDLE
+                || (gesture.current_button() == gdk::BUTTON_PRIMARY && space_held.get());
+            drag_active.set(allowed);
+            if !allowed {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
+            let viewer = viewer.borrow();
+            drag_start_x.set(viewer.scroller.hadjustment().value());
+            drag_start_y.set(viewer.scroller.vadjustment().value());
+        }
+    });
+    drag.connect_drag_update({
+        let viewer = viewer.clone();
+        let space_held = space_held.clone();
+        let space_dragged = space_dragged.clone();
+        let drag_active = drag_active.clone();
+        let drag_start_x = drag_start_x.clone();
+        let drag_start_y = drag_start_y.clone();
+        move |_, offset_x, offset_y| {
+            if !drag_active.get() {
+                return;
+            }
+            if space_held.get() && offset_x.hypot(offset_y) > 3.0 {
+                space_dragged.set(true);
+            }
+            let viewer = viewer.borrow();
+            viewer
+                .scroller
+                .hadjustment()
+                .set_value(drag_start_x.get() - offset_x);
+            viewer
+                .scroller
+                .vadjustment()
+                .set_value(drag_start_y.get() - offset_y);
+        }
+    });
+    drag.connect_drag_end({
+        let drag_active = drag_active.clone();
+        move |_, _, _| drag_active.set(false)
+    });
+    scroller.add_controller(drag);
 
     let scroll_accumulator = Rc::new(Cell::new(0.0_f64));
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
@@ -1114,7 +1188,7 @@ fn show_help(parent: &gtk::ApplicationWindow) {
         ("First / last image", "Home / End"),
         ("Zoom in / out", "+ / −"),
         ("Fit image to window", "0"),
-        ("Pan while zoomed", "Arrow keys"),
+        ("Pan while zoomed", "Arrows, Space+drag, middle-drag"),
         ("Toggle fullscreen", "F"),
         ("Toggle image info", "I"),
         ("Toggle quick edit", "E"),
