@@ -28,7 +28,7 @@ Build and run:
 
 ```bash
 cargo build --release
-target/release/better-image-view /path/to/image.jpg
+target/release/biv /path/to/image.jpg
 ```
 
 If [`just`](https://just.systems/) is installed, the project also provides short,
@@ -57,6 +57,7 @@ Keys and controls:
 - `I`: toggle a minimal filename, resolution, file-type, and current zoom overlay
 - `E`: toggle quick editing with rotate, downsize, and Save Copy
 - `P`: toggle the right-side metadata and EXIF panel
+- `H`: show keyboard shortcuts
 - Ctrl+P: open the print dialog for the current source image
 - Delete: check whether Trash is available, then show one confirmation for either
   recoverable “Move to Trash” or “Delete Permanently”; the delete action is the default

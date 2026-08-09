@@ -778,7 +778,7 @@ fn main() -> glib::ExitCode {
     }
 
     let Some(initial_path) = env::args_os().nth(1).map(PathBuf::from) else {
-        eprintln!("usage: better-image-view IMAGE");
+        eprintln!("usage: biv IMAGE");
         return glib::ExitCode::FAILURE;
     };
 
@@ -1046,6 +1046,7 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
                 gdk::Key::i | gdk::Key::I => viewer.borrow().toggle_info(),
                 gdk::Key::e | gdk::Key::E => viewer.borrow().toggle_edit(),
                 gdk::Key::p | gdk::Key::P => viewer.borrow().toggle_metadata(),
+                gdk::Key::h | gdk::Key::H => show_help(&viewer.borrow().window),
                 gdk::Key::Delete => request_delete(viewer.clone()),
                 gdk::Key::Escape | gdk::Key::q => app.quit(),
                 _ => return glib::Propagation::Proceed,
@@ -1104,6 +1105,63 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
             viewer.borrow().print();
         });
     }
+}
+
+fn show_help(parent: &gtk::ApplicationWindow) {
+    let shortcuts = [
+        ("Next image", "Page Down, Space, Right, scroll down"),
+        ("Previous image", "Page Up, Backspace, Left, scroll up"),
+        ("First / last image", "Home / End"),
+        ("Zoom in / out", "+ / −"),
+        ("Fit image to window", "0"),
+        ("Pan while zoomed", "Arrow keys"),
+        ("Toggle fullscreen", "F"),
+        ("Toggle image info", "I"),
+        ("Toggle quick edit", "E"),
+        ("Toggle metadata", "P"),
+        ("Print", "Ctrl+P"),
+        ("Delete", "Delete"),
+        ("Open this help", "H"),
+        ("Quit", "Q or Escape"),
+    ];
+
+    let grid = gtk::Grid::builder()
+        .column_spacing(32)
+        .row_spacing(10)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .build();
+    for (row, (action, keys)) in shortcuts.iter().enumerate() {
+        let action = gtk::Label::builder().label(*action).xalign(0.0).build();
+        let keys = gtk::Label::builder().label(*keys).xalign(1.0).build();
+        keys.add_css_class("dim-label");
+        grid.attach(&action, 0, row as i32, 1, 1);
+        grid.attach(&keys, 1, row as i32, 1, 1);
+    }
+
+    let help = gtk::Window::builder()
+        .title("Keyboard Shortcuts")
+        .transient_for(parent)
+        .modal(true)
+        .resizable(false)
+        .child(&grid)
+        .build();
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed({
+        let help = help.clone();
+        move |_, key, _, _| {
+            if key == gdk::Key::Escape || key == gdk::Key::h || key == gdk::Key::H {
+                help.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        }
+    });
+    help.add_controller(keys);
+    help.present();
 }
 
 fn install_context_menu(viewer: Rc<RefCell<Viewer>>) {
