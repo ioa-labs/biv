@@ -46,8 +46,9 @@ Run `just` without arguments to list all available recipes.
 
 Keys and controls:
 
-- Page Down, Space, or mouse wheel down: next image
-- Page Up, Backspace, or mouse wheel up: previous image
+- Page Down, Space, or mouse wheel down at default zoom: next image
+- Page Up, Backspace, or mouse wheel up at default zoom: previous image
+- Mouse wheel while zoomed in: scroll the image without changing images at its edges
 - Left / Right at default zoom: previous / next image
 - Arrow keys, Space+drag, or middle-mouse drag while zoomed in: pan the image
 - Home / End: first / last image

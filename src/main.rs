@@ -108,6 +108,10 @@ fn format_zoom(zoom: f64) -> String {
     }
 }
 
+fn wheel_navigates_images(is_zoomed: bool) -> bool {
+    !is_zoomed
+}
+
 mod canvas_imp {
     use super::*;
 
@@ -1139,6 +1143,10 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
         let viewer = viewer.clone();
         let accumulator = scroll_accumulator.clone();
         move |_, _, dy| {
+            if !wheel_navigates_images(viewer.borrow().canvas.is_zoomed()) {
+                accumulator.set(0.0);
+                return glib::Propagation::Stop;
+            }
             let total = accumulator.get() + dy;
             if total.abs() >= 1.0 {
                 viewer
@@ -2640,6 +2648,12 @@ mod tests {
         assert_eq!(format_zoom(1.0), "100%");
         assert_eq!(format_zoom(0.667), "66.7%");
         assert_eq!(format_zoom(0.125), "12.5%");
+    }
+
+    #[test]
+    fn mouse_wheel_only_navigates_at_default_zoom() {
+        assert!(wheel_navigates_images(false));
+        assert!(!wheel_navigates_images(true));
     }
 
     #[test]
