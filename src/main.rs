@@ -1325,10 +1325,15 @@ fn request_save_copy(viewer: Rc<RefCell<Viewer>>) {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("image");
-    let extension = source
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("jpg");
+    // vips cannot write raw formats: edited copies of raws become JPEGs.
+    let extension = if is_raw_image(&source) {
+        "jpg"
+    } else {
+        source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("jpg")
+    };
     let dialog = gtk::FileDialog::builder()
         .title("Save Edited Copy")
         .initial_name(format!("{stem}-edited.{extension}"))
@@ -1392,10 +1397,22 @@ fn save_edited_copy(
     let destination_name = destination
         .to_str()
         .ok_or_else(|| "destination filename is not valid UTF-8".to_string())?;
-    let image = VipsImage::new_from_file(source_name).map_err(|error| error.to_string())?;
-    // Some loaders reject malformed orientation metadata. Treat that as
-    // "already upright" rather than making an otherwise valid export fail.
-    let image = ops::autorot(&image).unwrap_or(image);
+    // Keeps the preview bytes alive: vips images loaded from a buffer read it
+    // lazily, so the backing store must outlive the write below.
+    let _raw_backing;
+    let image = if is_raw_image(source_path) {
+        _raw_backing = std::fs::read(source_path).map_err(|error| error.to_string())?;
+        let info = parse_raw_file(&_raw_backing)?;
+        let image = VipsImage::new_from_buffer(&_raw_backing[info.preview], "")
+            .map_err(|e| e.to_string())?;
+        orient_upright(image, info.orientation)?
+    } else {
+        _raw_backing = Vec::new();
+        let image = VipsImage::new_from_file(source_name).map_err(|error| error.to_string())?;
+        // Some loaders reject malformed orientation metadata. Treat that as
+        // "already upright" rather than making an otherwise valid export fail.
+        ops::autorot(&image).unwrap_or(image)
+    };
     let image = match rotation % 4 {
         0 => image,
         1 => ops::rot(&image, ops::Angle::D90).map_err(|error| error.to_string())?,
@@ -2376,6 +2393,9 @@ fn decode_thumbnail(path: &Path) -> Result<DecodedFrame, String> {
     let filename = path
         .to_str()
         .ok_or_else(|| "filename is not valid UTF-8".to_string())?;
+    if is_raw_image(path) {
+        return decode_raw_thumbnail(path);
+    }
     let raw_source = VipsImage::new_from_file(filename).map_err(|e| e.to_string())?;
     // vips_thumbnail() below already rotates from EXIF orientation. Avoid an
     // additional autorot operation in the hot loading path: malformed metadata
@@ -2392,7 +2412,13 @@ fn decode_thumbnail(path: &Path) -> Result<DecodedFrame, String> {
         .and_then(|value| value.to_str())
         .map(|value| value.to_ascii_uppercase())
         .unwrap_or_else(|| "Unknown".to_string());
-    let metadata = describe_metadata(path, &raw_source, &file_type);
+    let metadata = describe_metadata(
+        path,
+        &raw_source,
+        &file_type,
+        raw_source.get_width(),
+        raw_source.get_height(),
+    );
     let options = ops::ThumbnailOptions {
         height: DECODE_HEIGHT,
         size: ops::Size::Down,
@@ -2400,6 +2426,72 @@ fn decode_thumbnail(path: &Path) -> Result<DecodedFrame, String> {
     };
     let thumbnail =
         ops::thumbnail_with_opts(filename, DECODE_WIDTH, &options).map_err(|e| e.to_string())?;
+    finish_frame(
+        thumbnail,
+        path,
+        source_width,
+        source_height,
+        source_dpi,
+        file_type,
+        metadata,
+    )
+}
+
+/// Nikon raw files: libvips' tiffload wins the loader sniff (a NEF is a TIFF
+/// container) but only sees the 160×120 IFD0 thumbnail, so decode the largest
+/// embedded JPEG preview instead — full sensor resolution on modern bodies.
+fn decode_raw_thumbnail(path: &Path) -> Result<DecodedFrame, String> {
+    let data =
+        std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let info = parse_raw_file(&data)?;
+    let jpeg = &data[info.preview.clone()];
+    let source = VipsImage::new_from_buffer(jpeg, "").map_err(|e| e.to_string())?;
+    let (preview_width, preview_height) = (source.get_width(), source.get_height());
+    let (source_width, source_height) = if (5..=8).contains(&info.orientation) {
+        (preview_height, preview_width)
+    } else {
+        (preview_width, preview_height)
+    };
+    let file_type = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_uppercase())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let mut metadata = describe_metadata(path, &source, &file_type, preview_width, preview_height);
+    if !info.exif.is_empty() {
+        metadata.push_str("\n\nEXIF");
+        for (label, value) in &info.exif {
+            metadata.push_str(&format!("\n{label}: {value}"));
+        }
+    }
+    let options = ops::ThumbnailBufferOptions {
+        height: DECODE_HEIGHT,
+        size: ops::Size::Down,
+        ..Default::default()
+    };
+    let thumbnail =
+        ops::thumbnail_buffer_with_opts(jpeg, DECODE_WIDTH, &options).map_err(|e| e.to_string())?;
+    let thumbnail = orient_upright(thumbnail, info.orientation)?;
+    finish_frame(
+        thumbnail,
+        path,
+        source_width,
+        source_height,
+        None,
+        file_type,
+        metadata,
+    )
+}
+
+fn finish_frame(
+    thumbnail: VipsImage,
+    path: &Path,
+    source_width: i32,
+    source_height: i32,
+    source_dpi: Option<f64>,
+    file_type: String,
+    metadata: String,
+) -> Result<DecodedFrame, String> {
     let srgb =
         ops::colourspace(&thumbnail, ops::Interpretation::Srgb).map_err(|e| e.to_string())?;
     let rgba = ensure_rgba(srgb)?;
@@ -2429,7 +2521,26 @@ fn decode_thumbnail(path: &Path) -> Result<DecodedFrame, String> {
     })
 }
 
-fn describe_metadata(path: &Path, image: &VipsImage, file_type: &str) -> String {
+/// Rotate a decoded image upright per the EXIF orientation value. Mirrored
+/// orientations (2, 4, 5, 7) never come out of a camera; treat them as their
+/// unmirrored counterparts' rotations only when they carry one.
+fn orient_upright(image: VipsImage, orientation: u16) -> Result<VipsImage, String> {
+    let angle = match orientation {
+        3 | 4 => ops::Angle::D180,
+        5 | 6 => ops::Angle::D90,
+        7 | 8 => ops::Angle::D270,
+        _ => return Ok(image),
+    };
+    ops::rot(&image, angle).map_err(|e| e.to_string())
+}
+
+fn describe_metadata(
+    path: &Path,
+    image: &VipsImage,
+    file_type: &str,
+    width: i32,
+    height: i32,
+) -> String {
     let mut lines = vec![
         format!(
             "File\n{}\n",
@@ -2438,7 +2549,7 @@ fn describe_metadata(path: &Path, image: &VipsImage, file_type: &str) -> String 
                 .unwrap_or("image")
         ),
         format!("Type: {file_type}"),
-        format!("Dimensions: {} × {}", image.get_width(), image.get_height()),
+        format!("Dimensions: {width} × {height}"),
         format!("Bands: {}", image.get_bands()),
     ];
     if let Ok(file) = std::fs::metadata(path) {
@@ -2596,6 +2707,196 @@ fn is_supported_image(path: &Path) -> bool {
             )
         })
         .unwrap_or(false)
+        || is_raw_image(path)
+}
+
+fn is_raw_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "nef" | "nrw"))
+        .unwrap_or(false)
+}
+
+struct RawFileInfo {
+    /// Byte range of the largest embedded JPEG preview.
+    preview: std::ops::Range<usize>,
+    /// EXIF orientation of the shot; the preview carries no EXIF of its own.
+    orientation: u16,
+    /// Display-ready (label, value) pairs harvested from the EXIF tags.
+    exif: Vec<(&'static str, String)>,
+}
+
+/// Parse a TIFF-based raw file without decoding the sensor data. Previews sit
+/// in IFDs (IFD0's SubIFDs on Nikon bodies) as JPEGInterchangeFormat
+/// offset/length tag pairs; the raw sensor IFD has neither tag and is skipped
+/// naturally. Camera EXIF is read here too: neither libtiff nor the preview
+/// JPEG exposes it.
+fn parse_raw_file(data: &[u8]) -> Result<RawFileInfo, String> {
+    const ORIENTATION: u16 = 0x0112;
+    const SUB_IFDS: u16 = 0x014a;
+    const EXIF_IFD: u16 = 0x8769;
+    const JPEG_OFFSET: u16 = 0x0201;
+    const JPEG_LENGTH: u16 = 0x0202;
+    const ASCII: u16 = 2;
+
+    let big_endian = match data.get(..4) {
+        Some([b'I', b'I', 42, 0]) => false,
+        Some([b'M', b'M', 0, 42]) => true,
+        _ => return Err("not a TIFF-based raw file".to_string()),
+    };
+    let u16_at = |offset: usize| -> Option<u16> {
+        let bytes: [u8; 2] = data.get(offset..offset + 2)?.try_into().ok()?;
+        Some(if big_endian {
+            u16::from_be_bytes(bytes)
+        } else {
+            u16::from_le_bytes(bytes)
+        })
+    };
+    let u32_at = |offset: usize| -> Option<u32> {
+        let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+        Some(if big_endian {
+            u32::from_be_bytes(bytes)
+        } else {
+            u32::from_le_bytes(bytes)
+        })
+    };
+    // Values wider than 4 bytes live elsewhere; the entry's value field then
+    // holds their offset. Shorter values are left-justified in place.
+    let ascii_at = |count: usize, entry: usize| -> Option<String> {
+        let start = if count <= 4 {
+            entry + 8
+        } else {
+            u32_at(entry + 8)? as usize
+        };
+        let bytes = data.get(start..start + count)?;
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let text = String::from_utf8_lossy(&bytes[..end]).trim().to_string();
+        (!text.is_empty()).then_some(text)
+    };
+    let rational_at = |entry: usize| -> Option<(u32, u32)> {
+        let offset = u32_at(entry + 8)? as usize;
+        Some((u32_at(offset)?, u32_at(offset + 4)?))
+    };
+
+    let mut queue = vec![u32_at(4).ok_or("truncated TIFF header")? as usize];
+    let mut visited = Vec::new();
+    let mut orientation = None;
+    let mut best: Option<std::ops::Range<usize>> = None;
+    // First value wins for every EXIF field: IFD0 and its EXIF IFD are walked
+    // before any thumbnail IFDs that might repeat tags.
+    let mut strings: HashMap<u16, String> = HashMap::new();
+    let mut rationals: HashMap<u16, (u32, u32)> = HashMap::new();
+    let mut iso = None;
+    while let Some(ifd) = queue.pop() {
+        if ifd == 0 || visited.contains(&ifd) || visited.len() >= 64 {
+            continue;
+        }
+        visited.push(ifd);
+        let Some(entries) = u16_at(ifd) else { continue };
+        let mut jpeg_offset = None;
+        let mut jpeg_length = None;
+        for index in 0..entries as usize {
+            let entry = ifd + 2 + index * 12;
+            let Some(tag) = u16_at(entry) else { break };
+            let type_code = u16_at(entry + 2).unwrap_or(0);
+            let count = u32_at(entry + 4).unwrap_or(0) as usize;
+            match tag {
+                ORIENTATION => orientation = orientation.or_else(|| u16_at(entry + 8)),
+                SUB_IFDS | EXIF_IFD => {
+                    let array = if count == 1 {
+                        entry + 8
+                    } else {
+                        match u32_at(entry + 8) {
+                            Some(offset) => offset as usize,
+                            None => continue,
+                        }
+                    };
+                    for sub in 0..count.min(16) {
+                        if let Some(offset) = u32_at(array + sub * 4) {
+                            queue.push(offset as usize);
+                        }
+                    }
+                }
+                JPEG_OFFSET => jpeg_offset = u32_at(entry + 8),
+                JPEG_LENGTH => jpeg_length = u32_at(entry + 8),
+                0x010f | 0x0110 | 0x0131 | 0x0132 | 0x013b | 0x8298 | 0x9003 | 0xa433 | 0xa434 => {
+                    if type_code == ASCII
+                        && !strings.contains_key(&tag)
+                        && let Some(text) = ascii_at(count, entry)
+                    {
+                        strings.insert(tag, text);
+                    }
+                }
+                0x829a | 0x829d | 0x920a => {
+                    if !rationals.contains_key(&tag)
+                        && let Some(value) = rational_at(entry)
+                    {
+                        rationals.insert(tag, value);
+                    }
+                }
+                0x8827 => iso = iso.or_else(|| u16_at(entry + 8)),
+                _ => {}
+            }
+        }
+        if let Some(next) = u32_at(ifd + 2 + entries as usize * 12) {
+            queue.push(next as usize);
+        }
+        if let (Some(offset), Some(length)) = (jpeg_offset, jpeg_length) {
+            let range = offset as usize..offset as usize + length as usize;
+            let is_jpeg = data
+                .get(range.clone())
+                .is_some_and(|bytes| bytes.starts_with(&[0xff, 0xd8]));
+            if is_jpeg && length as usize > best.as_ref().map_or(0, ExactSizeIterator::len) {
+                best = Some(range);
+            }
+        }
+    }
+
+    fn push_string(
+        strings: &mut HashMap<u16, String>,
+        exif: &mut Vec<(&'static str, String)>,
+        label: &'static str,
+        tag: u16,
+    ) {
+        if let Some(text) = strings.remove(&tag) {
+            exif.push((label, text));
+        }
+    }
+    let mut exif = Vec::new();
+    push_string(&mut strings, &mut exif, "Camera maker", 0x010f);
+    push_string(&mut strings, &mut exif, "Camera model", 0x0110);
+    push_string(&mut strings, &mut exif, "Software", 0x0131);
+    if let Some(captured) = strings.remove(&0x9003).or_else(|| strings.remove(&0x0132)) {
+        exif.push(("Captured", captured));
+    }
+    push_string(&mut strings, &mut exif, "Artist", 0x013b);
+    push_string(&mut strings, &mut exif, "Copyright", 0x8298);
+    if let Some((num, den)) = rationals.get(&0x829a).filter(|&&(n, d)| n > 0 && d > 0) {
+        let value = if num < den && den % num == 0 {
+            format!("1/{} s", den / num)
+        } else {
+            format!("{:.1} s", *num as f64 / *den as f64)
+        };
+        exif.push(("Exposure", value));
+    }
+    if let Some((num, den)) = rationals.get(&0x829d).filter(|&&(_, d)| d > 0) {
+        exif.push(("Aperture", format!("f/{}", *num as f64 / *den as f64)));
+    }
+    if let Some(iso) = iso {
+        exif.push(("ISO", iso.to_string()));
+    }
+    if let Some((num, den)) = rationals.get(&0x920a).filter(|&&(_, d)| d > 0) {
+        exif.push(("Focal length", format!("{} mm", *num as f64 / *den as f64)));
+    }
+    push_string(&mut strings, &mut exif, "Lens maker", 0xa433);
+    push_string(&mut strings, &mut exif, "Lens", 0xa434);
+
+    let preview = best.ok_or_else(|| "no embedded JPEG preview found".to_string())?;
+    Ok(RawFileInfo {
+        preview,
+        orientation: orientation.unwrap_or(1),
+        exif,
+    })
 }
 
 #[cfg(test)]
@@ -2776,5 +3077,78 @@ mod tests {
             frame.pixels.len(),
             frame.width as usize * frame.height as usize * 4
         );
+    }
+
+    /// A minimal little-endian TIFF mimicking a NEF: IFD0 carries orientation,
+    /// an EXIF field, and a SubIFDs tag; each SubIFD points at one fake JPEG
+    /// via the JPEGInterchangeFormat pair. The parser must pick the larger
+    /// JPEG.
+    fn synthetic_nef() -> Vec<u8> {
+        let mut data = vec![b'I', b'I', 42, 0, 8, 0, 0, 0];
+        let entry = |data: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32| {
+            data.extend_from_slice(&tag.to_le_bytes());
+            data.extend_from_slice(&typ.to_le_bytes());
+            data.extend_from_slice(&count.to_le_bytes());
+            data.extend_from_slice(&value.to_le_bytes());
+        };
+        // Layout: IFD0 @8 (4 entries), SubIFD offsets array @62,
+        // SubIFD A @70, SubIFD B @100, small JPEG @130, large JPEG @136.
+        data.extend_from_slice(&4u16.to_le_bytes());
+        entry(&mut data, 0x010f, 2, 4, u32::from_le_bytes(*b"Nik\0"));
+        entry(&mut data, 0x0112, 3, 1, 8); // orientation: 270° to go upright
+        entry(&mut data, 0x014a, 4, 2, 62); // two SubIFDs, array offset
+        entry(&mut data, 0x0103, 3, 1, 1);
+        data.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        data.extend_from_slice(&70u32.to_le_bytes());
+        data.extend_from_slice(&100u32.to_le_bytes());
+        for (offset, length) in [(130u32, 4u32), (136u32, 6u32)] {
+            data.extend_from_slice(&2u16.to_le_bytes());
+            entry(&mut data, 0x0201, 4, 1, offset);
+            entry(&mut data, 0x0202, 4, 1, length);
+            data.extend_from_slice(&0u32.to_le_bytes());
+        }
+        data.extend_from_slice(&[0xff, 0xd8, 0xff, 0xd9, 0, 0]);
+        data.extend_from_slice(&[0xff, 0xd8, 0xaa, 0xbb, 0xff, 0xd9]);
+        data
+    }
+
+    #[test]
+    fn extracts_largest_preview_from_raw_subifds() {
+        let data = synthetic_nef();
+        let info = parse_raw_file(&data).expect("preview should be found");
+        assert_eq!(info.preview, 136..142);
+        assert_eq!(info.orientation, 8);
+        assert_eq!(info.exif, vec![("Camera maker", "Nik".to_string())]);
+    }
+
+    #[test]
+    #[ignore = "needs a real raw file: BIV_TEST_RAW=/path/to/image.nef cargo test -- --ignored"]
+    fn decodes_a_real_raw_file() {
+        let path = PathBuf::from(
+            std::env::var("BIV_TEST_RAW").expect("set BIV_TEST_RAW to a raw file path"),
+        );
+        let _vips = VipsApp::new("better-image-view-test", false)
+            .expect("libvips should initialize for the decode test");
+        let frame = decode_thumbnail(&path).expect("raw file should decode");
+        // A real preview is far bigger than the 160×120 IFD0 thumbnail that
+        // tiffload would have produced.
+        assert!(frame.source_width > 1000, "got {}", frame.source_width);
+        assert_eq!(
+            frame.pixels.len(),
+            frame.width as usize * frame.height as usize * 4
+        );
+        println!(
+            "decoded {}×{} (source {}×{})\n{}",
+            frame.width, frame.height, frame.source_width, frame.source_height, frame.metadata
+        );
+    }
+
+    #[test]
+    fn rejects_raw_files_without_previews() {
+        assert!(parse_raw_file(&[0; 16]).is_err());
+        assert!(parse_raw_file(b"II\x2a\x00\x08\x00\x00\x00\x00\x00").is_err());
+        // Truncated mid-IFD: must fail cleanly, not panic.
+        let data = synthetic_nef();
+        assert!(parse_raw_file(&data[..40]).is_err());
     }
 }
