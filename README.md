@@ -7,7 +7,8 @@ The first milestone is optimized for launching a file from Midnight Commander an
 moving through large images on a NAS without waiting for every key press:
 
 - native GTK4 window;
-- screen-sized, shrink-on-load decoding through libvips;
+- one NAS read per cached image, with the compressed source retained in RAM;
+- full decoding up to an 8192-pixel edge and shrink-on-load beyond that;
 - background loading away from GTK's main thread;
 - bounded decoded-image cache;
 - predictive preloading in the current navigation direction.
@@ -56,6 +57,8 @@ Keys and controls:
 - `0`: fit image to window
 - `F`: toggle fullscreen (the viewer starts fullscreen)
 - `I`: toggle a minimal filename, resolution, file-type, and current zoom overlay
+- `R`: toggle full-resolution loading; reduced images are re-decoded from the compressed
+  bytes already cached in RAM rather than read from the NAS again
 - `E`: toggle quick editing with rotate, downsize, and Save Copy
 - `P`: toggle the right-side metadata and EXIF panel
 - `H`: show keyboard shortcuts
@@ -93,7 +96,14 @@ fallback is 300 DPI. The source is decoded at the printer’s reported resolutio
 For debugging, `BIV_DEBUG_PRINT=1` opens the print dialog on startup and jumps to the
 Image Settings tab.
 
-The cache defaults to 512 MiB. Override it with `BETTER_IMAGE_VIEW_CACHE_MB`.
+Images larger than an 8192-pixel edge show a persistent reduced-preview indicator.
+Press `R` to stop resizing and decode the full bitmap. This can consume several
+gigabytes for exceptionally large images; while full-resolution mode is enabled,
+predictive preloading is disabled. The compressed source remains cached, so changing
+quality does not cause a second NAS transfer.
+
+The cache defaults to 4096 MiB and accounts for both compressed sources and decoded
+pixels. Override it with `BETTER_IMAGE_VIEW_CACHE_MB`.
 
 The viewer defaults GTK to its OpenGL renderer to avoid repeated Vulkan
 `VK_SUBOPTIMAL_KHR` warnings when changing images on affected Linux graphics stacks.

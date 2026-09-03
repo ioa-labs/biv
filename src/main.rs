@@ -15,9 +15,8 @@ use std::thread;
 use std::time::Duration;
 
 const APP_ID: &str = "dev.aethera.BetterImageView";
-const DEFAULT_CACHE_MB: usize = 512;
-const DECODE_WIDTH: i32 = 2560;
-const DECODE_HEIGHT: i32 = 1600;
+const DEFAULT_CACHE_MB: usize = 4096;
+const DEFAULT_DECODE_EDGE: i32 = 8192;
 const ZOOM_LEVELS: &[f64] = &[
     0.125, 0.167, 0.25, 0.333, 0.5, 0.667, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0,
     10.0, 12.0, 16.0, 20.0, 24.0, 32.0,
@@ -295,6 +294,12 @@ enum LoaderCommand {
     Batch {
         generation: u64,
         paths: Vec<PathBuf>,
+        full_resolution: bool,
+    },
+    DecodeMemory {
+        generation: u64,
+        path: PathBuf,
+        encoded: Arc<[u8]>,
     },
     Stop,
 }
@@ -311,11 +316,13 @@ struct DecodedFrame {
     source_dpi: Option<f64>,
     file_type: String,
     metadata: String,
+    reduced: bool,
+    encoded: Arc<[u8]>,
 }
 
 impl DecodedFrame {
     fn size_bytes(&self) -> usize {
-        self.pixels.len()
+        self.pixels.len() + self.encoded.len()
     }
 }
 
@@ -414,6 +421,7 @@ struct Viewer {
     cache: FrameCache,
     loader_tx: mpsc::Sender<LoaderCommand>,
     skip_delete_confirmation: Cell<bool>,
+    full_resolution: Cell<bool>,
 }
 
 impl Viewer {
@@ -446,13 +454,19 @@ impl Viewer {
         let current = self.current_path().to_path_buf();
         self.edit_rotation.set(0);
         self.update_title();
-        if let Some(frame) = self.cache.get(&current) {
+        let cached_is_usable = self
+            .cache
+            .frames
+            .get(&current)
+            .is_some_and(|frame| !self.full_resolution.get() || !frame.reduced);
+        if cached_is_usable {
+            let frame = self.cache.get(&current).expect("checked above");
             self.resize_edge
                 .set_range(1.0, frame.source_width.max(frame.source_height) as f64);
             self.resize_edge
                 .set_value(frame.source_width.max(frame.source_height) as f64);
             self.present_frame(&frame);
-            self.status.set_text("");
+            self.update_load_status(&frame);
         } else {
             self.status.set_text("Loading…");
         }
@@ -495,10 +509,50 @@ impl Viewer {
             .and_then(|value| value.to_str())
             .unwrap_or("image");
         let zoom = format_zoom(self.canvas.effective_zoom().unwrap_or(1.0));
+        let quality = if frame.reduced {
+            format!("reduced {} × {}", frame.width, frame.height)
+        } else {
+            "full resolution".to_string()
+        };
         self.info.set_text(&format!(
-            "{name}\n{} × {} · {} · {zoom}",
+            "{name}\n{} × {} · {} · {zoom}\n{quality}",
             frame.source_width, frame.source_height, frame.file_type
         ));
+    }
+
+    fn update_load_status(&self, frame: &DecodedFrame) {
+        if frame.reduced {
+            self.status.set_text(&format!(
+                "Reduced preview {} × {} — press R for full resolution",
+                frame.width, frame.height
+            ));
+        } else {
+            self.status.set_text("");
+        }
+    }
+
+    fn toggle_full_resolution(&mut self) {
+        let enabled = !self.full_resolution.get();
+        self.full_resolution.set(enabled);
+        self.generation += 1;
+        if enabled {
+            let current = self.current_path().to_path_buf();
+            if let Some(frame) = self.cache.frames.get(&current) {
+                if frame.reduced {
+                    self.status
+                        .set_text("Decoding full resolution from memory…");
+                    let _ = self.loader_tx.send(LoaderCommand::DecodeMemory {
+                        generation: self.generation,
+                        path: current,
+                        encoded: frame.encoded.clone(),
+                    });
+                    return;
+                }
+            }
+        } else {
+            self.status.set_text("8K safety limit enabled");
+        }
+        self.show_or_load();
     }
 
     fn zoom_in(&self) {
@@ -638,8 +692,21 @@ impl Viewer {
     }
 
     fn request_prefetch(&self) {
+        if self.full_resolution.get()
+            && let Some(frame) = self.cache.frames.get(self.current_path())
+            && frame.reduced
+        {
+            let _ = self.loader_tx.send(LoaderCommand::DecodeMemory {
+                generation: self.generation,
+                path: self.current_path().to_path_buf(),
+                encoded: frame.encoded.clone(),
+            });
+            return;
+        }
         let mut requested = vec![self.current_path().to_path_buf()];
-        let offsets: &[i32] = if self.direction >= 0 {
+        let offsets: &[i32] = if self.full_resolution.get() {
+            &[]
+        } else if self.direction >= 0 {
             &[1, 2, -1]
         } else {
             &[-1, -2, 1]
@@ -657,6 +724,7 @@ impl Viewer {
         let _ = self.loader_tx.send(LoaderCommand::Batch {
             generation: self.generation,
             paths: requested,
+            full_resolution: self.full_resolution.get(),
         });
     }
 
@@ -673,7 +741,7 @@ impl Viewer {
                         self.resize_edge
                             .set_value(frame.source_width.max(frame.source_height) as f64);
                         self.present_frame(&frame);
-                        self.status.set_text("");
+                        self.update_load_status(&frame);
                     }
                 }
             }
@@ -976,6 +1044,7 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
         cache: FrameCache::new(cache_mb * 1024 * 1024),
         loader_tx,
         skip_delete_confirmation: Cell::new(false),
+        full_resolution: Cell::new(false),
     }));
     for property in ["width", "height"] {
         canvas.connect_notify_local(Some(property), {
@@ -1060,6 +1129,7 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
                 gdk::Key::_0 | gdk::Key::KP_0 => viewer.borrow().zoom_fit(),
                 gdk::Key::f | gdk::Key::F => viewer.borrow().toggle_fullscreen(),
                 gdk::Key::i | gdk::Key::I => viewer.borrow().toggle_info(),
+                gdk::Key::r | gdk::Key::R => viewer.borrow_mut().toggle_full_resolution(),
                 gdk::Key::e | gdk::Key::E => viewer.borrow().toggle_edit(),
                 gdk::Key::p | gdk::Key::P => viewer.borrow().toggle_metadata(),
                 gdk::Key::h | gdk::Key::H => show_help(&viewer.borrow().window),
@@ -1202,6 +1272,7 @@ fn show_help(parent: &gtk::ApplicationWindow) {
         ("Pan while zoomed", "Arrows, Space+drag, middle-drag"),
         ("Toggle fullscreen", "F"),
         ("Toggle image info", "I"),
+        ("Toggle full-resolution loading", "R"),
         ("Toggle quick edit", "E"),
         ("Toggle metadata", "P"),
         ("Print", "Ctrl+P"),
@@ -2339,12 +2410,35 @@ fn loader_loop(rx: mpsc::Receiver<LoaderCommand>, tx: mpsc::Sender<LoaderEvent>)
                 Err(_) => return,
             },
         };
+        if matches!(command, LoaderCommand::Stop) {
+            return;
+        }
+        if let LoaderCommand::DecodeMemory {
+            generation,
+            path,
+            encoded,
+        } = command
+        {
+            let event = match decode_image_bytes(&path, encoded, true) {
+                Ok(frame) => LoaderEvent::Loaded { generation, frame },
+                Err(message) => LoaderEvent::Failed {
+                    generation,
+                    path,
+                    message,
+                },
+            };
+            if tx.send(event).is_err() {
+                return;
+            }
+            continue;
+        }
         let LoaderCommand::Batch {
             mut generation,
             mut paths,
+            mut full_resolution,
         } = command
         else {
-            break;
+            unreachable!()
         };
 
         loop {
@@ -2352,9 +2446,15 @@ fn loader_loop(rx: mpsc::Receiver<LoaderCommand>, tx: mpsc::Sender<LoaderEvent>)
                 Ok(LoaderCommand::Batch {
                     generation: newer_generation,
                     paths: newer_paths,
+                    full_resolution: newer_full_resolution,
                 }) => {
                     generation = newer_generation;
                     paths = newer_paths;
+                    full_resolution = newer_full_resolution;
+                }
+                Ok(command @ LoaderCommand::DecodeMemory { .. }) => {
+                    pending = Some(command);
+                    break;
                 }
                 Ok(LoaderCommand::Stop) => return,
                 Err(_) => break,
@@ -2368,10 +2468,14 @@ fn loader_loop(rx: mpsc::Receiver<LoaderCommand>, tx: mpsc::Sender<LoaderEvent>)
                         pending = Some(newer);
                         break;
                     }
+                    LoaderCommand::DecodeMemory { .. } => {
+                        pending = Some(newer);
+                        break;
+                    }
                     LoaderCommand::Stop => return,
                 }
             }
-            match decode_thumbnail(&path) {
+            match decode_image(&path, full_resolution) {
                 Ok(frame) => {
                     if tx.send(LoaderEvent::Loaded { generation, frame }).is_err() {
                         return;
@@ -2390,13 +2494,25 @@ fn loader_loop(rx: mpsc::Receiver<LoaderCommand>, tx: mpsc::Sender<LoaderEvent>)
 }
 
 fn decode_thumbnail(path: &Path) -> Result<DecodedFrame, String> {
-    let filename = path
-        .to_str()
-        .ok_or_else(|| "filename is not valid UTF-8".to_string())?;
+    decode_image(path, false)
+}
+
+fn decode_image(path: &Path, full_resolution: bool) -> Result<DecodedFrame, String> {
+    let encoded: Arc<[u8]> = std::fs::read(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?
+        .into();
+    decode_image_bytes(path, encoded, full_resolution)
+}
+
+fn decode_image_bytes(
+    path: &Path,
+    encoded: Arc<[u8]>,
+    full_resolution: bool,
+) -> Result<DecodedFrame, String> {
     if is_raw_image(path) {
-        return decode_raw_thumbnail(path);
+        return decode_raw_thumbnail(path, encoded, full_resolution);
     }
-    let raw_source = VipsImage::new_from_file(filename).map_err(|e| e.to_string())?;
+    let raw_source = VipsImage::new_from_buffer(&encoded, "").map_err(|e| e.to_string())?;
     // vips_thumbnail() below already rotates from EXIF orientation. Avoid an
     // additional autorot operation in the hot loading path: malformed metadata
     // must not prevent an otherwise decodable image from opening.
@@ -2419,13 +2535,17 @@ fn decode_thumbnail(path: &Path) -> Result<DecodedFrame, String> {
         raw_source.get_width(),
         raw_source.get_height(),
     );
-    let options = ops::ThumbnailOptions {
-        height: DECODE_HEIGHT,
-        size: ops::Size::Down,
-        ..Default::default()
+    let thumbnail = if full_resolution {
+        ops::autorot(&raw_source).map_err(|e| e.to_string())?
+    } else {
+        let options = ops::ThumbnailBufferOptions {
+            height: DEFAULT_DECODE_EDGE,
+            size: ops::Size::Down,
+            ..Default::default()
+        };
+        ops::thumbnail_buffer_with_opts(&encoded, DEFAULT_DECODE_EDGE, &options)
+            .map_err(|e| e.to_string())?
     };
-    let thumbnail =
-        ops::thumbnail_with_opts(filename, DECODE_WIDTH, &options).map_err(|e| e.to_string())?;
     finish_frame(
         thumbnail,
         path,
@@ -2434,17 +2554,20 @@ fn decode_thumbnail(path: &Path) -> Result<DecodedFrame, String> {
         source_dpi,
         file_type,
         metadata,
+        encoded,
     )
 }
 
 /// Nikon raw files: libvips' tiffload wins the loader sniff (a NEF is a TIFF
 /// container) but only sees the 160×120 IFD0 thumbnail, so decode the largest
 /// embedded JPEG preview instead — full sensor resolution on modern bodies.
-fn decode_raw_thumbnail(path: &Path) -> Result<DecodedFrame, String> {
-    let data =
-        std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let info = parse_raw_file(&data)?;
-    let jpeg = &data[info.preview.clone()];
+fn decode_raw_thumbnail(
+    path: &Path,
+    encoded: Arc<[u8]>,
+    full_resolution: bool,
+) -> Result<DecodedFrame, String> {
+    let info = parse_raw_file(&encoded)?;
+    let jpeg = &encoded[info.preview.clone()];
     let source = VipsImage::new_from_buffer(jpeg, "").map_err(|e| e.to_string())?;
     let (preview_width, preview_height) = (source.get_width(), source.get_height());
     let (source_width, source_height) = if (5..=8).contains(&info.orientation) {
@@ -2464,14 +2587,18 @@ fn decode_raw_thumbnail(path: &Path) -> Result<DecodedFrame, String> {
             metadata.push_str(&format!("\n{label}: {value}"));
         }
     }
-    let options = ops::ThumbnailBufferOptions {
-        height: DECODE_HEIGHT,
-        size: ops::Size::Down,
-        ..Default::default()
+    let thumbnail = if full_resolution {
+        orient_upright(source, info.orientation)?
+    } else {
+        let options = ops::ThumbnailBufferOptions {
+            height: DEFAULT_DECODE_EDGE,
+            size: ops::Size::Down,
+            ..Default::default()
+        };
+        let image = ops::thumbnail_buffer_with_opts(jpeg, DEFAULT_DECODE_EDGE, &options)
+            .map_err(|e| e.to_string())?;
+        orient_upright(image, info.orientation)?
     };
-    let thumbnail =
-        ops::thumbnail_buffer_with_opts(jpeg, DECODE_WIDTH, &options).map_err(|e| e.to_string())?;
-    let thumbnail = orient_upright(thumbnail, info.orientation)?;
     finish_frame(
         thumbnail,
         path,
@@ -2480,6 +2607,7 @@ fn decode_raw_thumbnail(path: &Path) -> Result<DecodedFrame, String> {
         None,
         file_type,
         metadata,
+        encoded,
     )
 }
 
@@ -2491,6 +2619,7 @@ fn finish_frame(
     source_dpi: Option<f64>,
     file_type: String,
     metadata: String,
+    encoded: Arc<[u8]>,
 ) -> Result<DecodedFrame, String> {
     let srgb =
         ops::colourspace(&thumbnail, ops::Interpretation::Srgb).map_err(|e| e.to_string())?;
@@ -2518,6 +2647,8 @@ fn finish_frame(
         source_dpi,
         file_type,
         metadata,
+        reduced: width != source_width || height != source_height,
+        encoded,
     })
 }
 
@@ -2915,6 +3046,8 @@ mod tests {
             source_dpi: None,
             file_type: "TEST".to_string(),
             metadata: String::new(),
+            reduced: false,
+            encoded: Arc::from([]),
         }
     }
 
