@@ -1477,6 +1477,17 @@ fn save_edited_copy(
         let image = VipsImage::new_from_buffer(&_raw_backing[info.preview], "")
             .map_err(|e| e.to_string())?;
         orient_upright(image, info.orientation)?
+    } else if source_path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bmp"))
+    {
+        _raw_backing = normalize_bmp_palette(
+            std::fs::read(source_path)
+                .map_err(|error| error.to_string())?
+                .into(),
+        )
+        .to_vec();
+        VipsImage::new_from_buffer(&_raw_backing, "").map_err(|e| e.to_string())?
     } else {
         _raw_backing = Vec::new();
         let image = VipsImage::new_from_file(source_name).map_err(|error| error.to_string())?;
@@ -2504,6 +2515,29 @@ fn decode_image(path: &Path, full_resolution: bool) -> Result<DecodedFrame, Stri
     decode_image_bytes(path, encoded, full_resolution)
 }
 
+/// Some writers put the number of possible RGB colors in biClrUsed even
+/// though no palette is stored. ImageMagick then tries to read a huge palette.
+/// Only repair uncompressed 24-bit BMPs whose pixels start directly after the
+/// DIB header; leave actual palettes and other BMP variants alone.
+fn normalize_bmp_palette(mut encoded: Arc<[u8]>) -> Arc<[u8]> {
+    if encoded.len() < 54 || &encoded[..2] != b"BM" {
+        return encoded;
+    }
+    let u32_at = |offset| u32::from_le_bytes(encoded[offset..offset + 4].try_into().unwrap());
+    let header_size = u32_at(14);
+    if header_size >= 40
+        && header_size.checked_add(14) == Some(u32_at(10))
+        && u32_at(10) as usize <= encoded.len()
+        && encoded[26..28] == [1, 0]
+        && encoded[28..30] == [24, 0]
+        && u32_at(30) == 0
+        && u32_at(46) == 1 << 24
+    {
+        Arc::make_mut(&mut encoded)[46..54].fill(0);
+    }
+    encoded
+}
+
 fn decode_image_bytes(
     path: &Path,
     encoded: Arc<[u8]>,
@@ -2512,6 +2546,7 @@ fn decode_image_bytes(
     if is_raw_image(path) {
         return decode_raw_thumbnail(path, encoded, full_resolution);
     }
+    let encoded = normalize_bmp_palette(encoded);
     let raw_source = VipsImage::new_from_buffer(&encoded, "").map_err(|e| e.to_string())?;
     // vips_thumbnail() below already rotates from EXIF orientation. Avoid an
     // additional autorot operation in the hot loading path: malformed metadata
@@ -2768,53 +2803,11 @@ fn sibling_images(initial_path: &Path) -> Result<Vec<PathBuf>, String> {
         .map(|entry| entry.path())
         .filter(|path| path.is_file() && is_supported_image(path))
         .collect();
-    paths.sort_by_cached_key(|path| {
-        natural_sort_key(
-            &path
-                .file_name()
-                .map(|name| name.to_string_lossy())
-                .unwrap_or_default(),
-        )
-    });
+    paths.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
     if paths.is_empty() {
         return Err(format!("no supported images in {}", parent.display()));
     }
     Ok(paths)
-}
-
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-enum NaturalChunk {
-    // Digit runs with leading zeros stripped: comparing stripped length first
-    // and then the digit string orders runs by numeric value without a parse
-    // that could overflow.
-    Number(usize, String),
-    Text(String),
-}
-
-/// Sort key matching file managers' natural order: case-insensitive, with
-/// digit runs compared as numbers so "img_9" sorts before "img_10". The full
-/// name tiebreaks entries whose chunks compare equal ("img01" vs "img1").
-fn natural_sort_key(name: &str) -> (Vec<NaturalChunk>, String) {
-    let lower = name.to_lowercase();
-    let mut chunks = Vec::new();
-    let mut rest = lower.as_str();
-    while !rest.is_empty() {
-        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-        let (run, tail) = if digits > 0 {
-            let (run, tail) = rest.split_at(digits);
-            let run = run.trim_start_matches('0');
-            (NaturalChunk::Number(run.len(), run.to_string()), tail)
-        } else {
-            let end = rest
-                .find(|c: char| c.is_ascii_digit())
-                .unwrap_or(rest.len());
-            let (run, tail) = rest.split_at(end);
-            (NaturalChunk::Text(run.to_string()), tail)
-        };
-        chunks.push(run);
-        rest = tail;
-    }
-    (chunks, name.to_string())
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -3170,26 +3163,35 @@ mod tests {
     }
 
     #[test]
-    fn sorts_folder_listing_naturally() {
-        let mut names = vec![
-            "IMG_10.jpg",
-            "img_9.jpg",
-            "IMG_2.jpg",
-            "img_01.jpg",
-            "img_1.jpg",
-            "cover.png",
+    fn sorts_sibling_images_lexicographically() {
+        let directory = env::temp_dir().join(format!(
+            "biv-sort-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let expected = [
+            "lat44p55_lon33p92_w100km_h40km_z13_sentinel-2.png",
+            "lat44p55_lon33p9_w84km_h40km_z12_google.png",
+            "lat44p55_lon33p9_w84km_h40km_z13_bing.png",
+            "lat44p55_lon33p9_w84km_h40km_z13_google.png",
+            "lat44p55_lon33p9_w84km_h40km_z13_sentinel-2.png",
         ];
-        names.sort_by_cached_key(|name| natural_sort_key(name));
+        // Create in reverse order so discovery must sort the actual siblings.
+        for name in expected.iter().rev() {
+            std::fs::write(directory.join(name), []).unwrap();
+        }
+        std::fs::create_dir(directory.join("!")).unwrap();
+        std::fs::write(directory.join("notes.txt"), []).unwrap();
+        let initial = directory.join(expected[0]);
+        let result = sibling_images(&initial);
+        std::fs::remove_dir_all(&directory).unwrap();
         assert_eq!(
-            names,
-            vec![
-                "cover.png",
-                "img_01.jpg",
-                "img_1.jpg",
-                "IMG_2.jpg",
-                "img_9.jpg",
-                "IMG_10.jpg",
-            ]
+            result.unwrap(),
+            expected.map(|name| directory.join(name)).to_vec()
         );
     }
 
@@ -3203,6 +3205,38 @@ mod tests {
 
         let _vips = VipsApp::new("better-image-view-test", false)
             .expect("libvips should initialize for the decode test");
+        // Reproduce the malformed palette counts found in маяк.bmp. A 1×1
+        // 24-bit BMP has one padded BGR row and no palette.
+        let mut bmp = vec![0u8; 58];
+        bmp[..2].copy_from_slice(b"BM");
+        for (offset, value) in [
+            (2, 58u32),
+            (10, 54),
+            (14, 40),
+            (18, 1),
+            (22, 1),
+            (34, 4),
+            (46, 1 << 24),
+            (50, 1 << 24),
+        ] {
+            bmp[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bmp[26] = 1;
+        bmp[28] = 24;
+        bmp[54..57].copy_from_slice(&[30, 20, 10]);
+        for full_resolution in [false, true] {
+            let frame =
+                decode_image_bytes(Path::new("маяк.bmp"), bmp.clone().into(), full_resolution)
+                    .expect("24-bit BMP with bogus palette counts should decode");
+            assert_eq!((frame.width, frame.height), (1, 1));
+            assert_eq!(&*frame.pixels, &[10, 20, 30, 255]);
+        }
+        if let Some(path) = env::var_os("BIV_TEST_IMAGE") {
+            for full_resolution in [false, true] {
+                decode_image(Path::new(&path), full_resolution)
+                    .expect("external regression image should decode");
+            }
+        }
         let frame = decode_thumbnail(&sample).expect("sample image should decode");
         assert!(frame.width > 0);
         assert!(frame.height > 0);
