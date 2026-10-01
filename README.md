@@ -81,6 +81,17 @@ Quick Edit is non-destructive. Rotation previews use the already decoded display
 Save Copy applies the selected rotation and maximum-edge downsize to the full-resolution
 source on a background worker. The source file is never changed.
 
+Animated GIF, WebP, and JPEG XL play automatically using the installed libvips
+decoders, with frame timing, transparency, and finite or infinite looping. Zoom and
+pan stay in place during playback; revisiting an image restarts it. No additional
+dependencies or video backend are required. APNG playback is not supported yet.
+
+Animations decode at their original size on the background loader and bypass the
+8K preview/full-resolution toggle. Decoded playback data is limited to 256 MiB per
+animation and included in the image cache budget; oversized or unsupported animations
+show their first frame with an explanation. Quick Edit is unavailable for animations.
+Copy Bitmap copies the displayed frame, while printing uses the first frame.
+
 Printing drives the in-process GTK print dialog (`GtkPrintUnixDialog`) directly and
 submits the rendered page as a print job. On current GTK, `GtkPrintOperation` routes
 through the desktop print portal, and the portal dialog cannot embed custom tabs — the

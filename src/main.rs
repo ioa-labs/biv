@@ -12,11 +12,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const APP_ID: &str = "dev.aethera.BetterImageView";
 const DEFAULT_CACHE_MB: usize = 4096;
 const DEFAULT_DECODE_EDGE: i32 = 8192;
+const MAX_ANIMATION_BYTES: usize = 256 * 1024 * 1024;
 const ZOOM_LEVELS: &[f64] = &[
     0.125, 0.167, 0.25, 0.333, 0.5, 0.667, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0,
     10.0, 12.0, 16.0, 20.0, 24.0, 32.0,
@@ -217,6 +218,11 @@ impl ImageCanvas {
         self.queue_draw();
     }
 
+    fn update_texture(&self, texture: &impl IsA<gdk::Texture>) {
+        self.imp().texture.replace(Some(texture.as_ref().clone()));
+        self.queue_draw();
+    }
+
     fn zoom_in(&self) {
         let imp = self.imp();
         if imp.texture.borrow().is_none() {
@@ -318,11 +324,47 @@ struct DecodedFrame {
     metadata: String,
     reduced: bool,
     encoded: Arc<[u8]>,
+    animation: Option<Animation>,
+    animation_notice: Option<String>,
+}
+
+#[derive(Debug)]
+struct Animation {
+    // libvips composites disposal/blending and returns a vertical strip.
+    pixels: Arc<[u8]>,
+    frame_ends_ms: Vec<u64>,
+    loops: u64,
+}
+
+impl Animation {
+    fn frame_at(&self, elapsed: Duration) -> usize {
+        let cycle = *self.frame_ends_ms.last().expect("animation has frames");
+        let elapsed = elapsed.as_millis();
+        if self.loops > 0 && elapsed >= cycle as u128 * self.loops as u128 {
+            return self.frame_ends_ms.len() - 1;
+        }
+        let position = (elapsed % cycle as u128) as u64;
+        self.frame_ends_ms.partition_point(|end| *end <= position)
+    }
+}
+
+struct Playback {
+    frame: Arc<DecodedFrame>,
+    started: Instant,
+    index: usize,
 }
 
 impl DecodedFrame {
     fn size_bytes(&self) -> usize {
-        self.pixels.len() + self.encoded.len()
+        self.pixels.len()
+            + self.encoded.len()
+            + self.animation.as_ref().map_or(0, |animation| {
+                animation.pixels.len() + animation.frame_ends_ms.len() * 8
+            })
+    }
+
+    fn is_animation(&self) -> bool {
+        self.animation.is_some() || self.animation_notice.is_some()
     }
 }
 
@@ -422,6 +464,7 @@ struct Viewer {
     loader_tx: mpsc::Sender<LoaderCommand>,
     skip_delete_confirmation: Cell<bool>,
     full_resolution: Cell<bool>,
+    playback: RefCell<Option<Playback>>,
 }
 
 impl Viewer {
@@ -451,14 +494,13 @@ impl Viewer {
     }
 
     fn show_or_load(&mut self) {
+        self.playback.replace(None);
         let current = self.current_path().to_path_buf();
         self.edit_rotation.set(0);
         self.update_title();
-        let cached_is_usable = self
-            .cache
-            .frames
-            .get(&current)
-            .is_some_and(|frame| !self.full_resolution.get() || !frame.reduced);
+        let cached_is_usable = self.cache.frames.get(&current).is_some_and(|frame| {
+            !self.full_resolution.get() || !frame.reduced || frame.is_animation()
+        });
         if cached_is_usable {
             let frame = self.cache.get(&current).expect("checked above");
             self.resize_edge
@@ -521,7 +563,9 @@ impl Viewer {
     }
 
     fn update_load_status(&self, frame: &DecodedFrame) {
-        if frame.reduced {
+        if let Some(notice) = &frame.animation_notice {
+            self.status.set_text(notice);
+        } else if frame.reduced {
             self.status.set_text(&format!(
                 "Reduced preview {} × {} — press R for full resolution",
                 frame.width, frame.height
@@ -532,6 +576,14 @@ impl Viewer {
     }
 
     fn toggle_full_resolution(&mut self) {
+        if self
+            .cache
+            .frames
+            .get(self.current_path())
+            .is_some_and(|frame| frame.is_animation())
+        {
+            return;
+        }
         let enabled = !self.full_resolution.get();
         self.full_resolution.set(enabled);
         self.generation += 1;
@@ -579,6 +631,16 @@ impl Viewer {
     }
 
     fn toggle_edit(&self) {
+        if self
+            .cache
+            .frames
+            .get(self.current_path())
+            .is_some_and(|frame| frame.is_animation())
+        {
+            self.status
+                .set_text("Quick Edit is available for still images only");
+            return;
+        }
         let reveal = !self.edit_panel.reveals_child();
         self.edit_panel.set_reveal_child(reveal);
         if reveal {
@@ -695,6 +757,7 @@ impl Viewer {
         if self.full_resolution.get()
             && let Some(frame) = self.cache.frames.get(self.current_path())
             && frame.reduced
+            && !frame.is_animation()
         {
             let _ = self.loader_tx.send(LoaderCommand::DecodeMemory {
                 generation: self.generation,
@@ -703,7 +766,10 @@ impl Viewer {
             });
             return;
         }
-        let mut requested = vec![self.current_path().to_path_buf()];
+        let mut requested = Vec::new();
+        if !self.cache.contains(self.current_path()) {
+            requested.push(self.current_path().to_path_buf());
+        }
         let offsets: &[i32] = if self.full_resolution.get() {
             &[]
         } else if self.direction >= 0 {
@@ -757,7 +823,16 @@ impl Viewer {
         }
     }
 
-    fn present_frame(&self, frame: &DecodedFrame) {
+    fn present_frame(&self, frame: &Arc<DecodedFrame>) {
+        self.playback
+            .replace(frame.animation.as_ref().map(|_| Playback {
+                frame: frame.clone(),
+                started: Instant::now(),
+                index: 0,
+            }));
+        if frame.is_animation() {
+            self.edit_panel.set_reveal_child(false);
+        }
         let rotation = self.edit_rotation.get();
         let texture = texture_for_rotation(frame, rotation);
         let (source_width, source_height) = if rotation % 2 == 0 {
@@ -772,6 +847,32 @@ impl Viewer {
         if self.edit_panel.reveals_child() {
             self.update_edit_dimensions(frame);
         }
+    }
+
+    fn advance_animation(&self) {
+        let mut playback = self.playback.borrow_mut();
+        let Some(playback) = playback.as_mut() else {
+            return;
+        };
+        let frame = &playback.frame;
+        let animation = frame.animation.as_ref().expect("playback has animation");
+        let index = animation.frame_at(playback.started.elapsed());
+        if index == playback.index {
+            return;
+        }
+        playback.index = index;
+        let size = frame.stride * frame.height as usize;
+        let strip = glib::Bytes::from_owned(animation.pixels.clone());
+        let bytes = glib::Bytes::from_bytes(&strip, index * size..(index + 1) * size);
+        let texture = gdk::MemoryTexture::new(
+            frame.width,
+            frame.height,
+            gdk::MemoryFormat::R8g8b8a8,
+            &bytes,
+            frame.stride,
+        );
+        // All frames have the same canvas size; preserve zoom and scroll position.
+        self.canvas.update_texture(&texture);
     }
 }
 
@@ -1045,6 +1146,7 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
         loader_tx,
         skip_delete_confirmation: Cell::new(false),
         full_resolution: Cell::new(false),
+        playback: RefCell::new(None),
     }));
     for property in ["width", "height"] {
         canvas.connect_notify_local(Some(property), {
@@ -1237,6 +1339,7 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
             while let Ok(event) = event_rx.try_recv() {
                 viewer.borrow_mut().accept(event);
             }
+            viewer.borrow().advance_animation();
             glib::ControlFlow::Continue
         }
     });
@@ -1244,6 +1347,7 @@ fn build_ui(app: &gtk::Application, paths: Vec<PathBuf>, index: usize) {
     window.connect_close_request({
         let viewer = viewer.clone();
         move |_| {
+            viewer.borrow().playback.replace(None);
             let _ = viewer.borrow().loader_tx.send(LoaderCommand::Stop);
             glib::Propagation::Proceed
         }
@@ -1385,6 +1489,17 @@ fn install_context_menu(viewer: Rc<RefCell<Viewer>>) {
 fn request_save_copy(viewer: Rc<RefCell<Viewer>>) {
     let (source, rotation, maximum_edge, window) = {
         let viewer = viewer.borrow();
+        if viewer
+            .cache
+            .frames
+            .get(viewer.current_path())
+            .is_some_and(|frame| frame.is_animation())
+        {
+            viewer
+                .status
+                .set_text("Quick Edit is available for still images only");
+            return;
+        }
         (
             viewer.current_path().to_path_buf(),
             viewer.edit_rotation.get(),
@@ -2570,6 +2685,54 @@ fn decode_image_bytes(
         raw_source.get_width(),
         raw_source.get_height(),
     );
+    // Only timed images are animations: multipage TIFF/HEIF remain still images.
+    let delays = if raw_source.get_n_pages() > 1 {
+        animation_delays(&encoded)
+    } else {
+        None
+    };
+    if let Some(delays) = delays {
+        let first = ops::autorot(&raw_source).map_err(|e| e.to_string())?;
+        let count = raw_source.get_n_pages() as usize;
+        let animation = decode_animation(&encoded, &raw_source, &delays, MAX_ANIMATION_BYTES);
+        // Large animations retain the ordinary reduced first-frame path.
+        if let Ok(animation) = animation {
+            let mut frame = finish_frame(
+                first,
+                path,
+                source_width,
+                source_height,
+                source_dpi,
+                file_type,
+                format!("{metadata}\nAnimation: {count} frames"),
+                encoded,
+            )?;
+            frame.animation = Some(animation);
+            return Ok(frame);
+        }
+        let notice = format!("Showing first frame — {}", animation.unwrap_err());
+        let mut frame = finish_frame(
+            ops::thumbnail_buffer_with_opts(
+                &encoded,
+                DEFAULT_DECODE_EDGE,
+                &ops::ThumbnailBufferOptions {
+                    height: DEFAULT_DECODE_EDGE,
+                    size: ops::Size::Down,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| e.to_string())?,
+            path,
+            source_width,
+            source_height,
+            source_dpi,
+            file_type,
+            metadata,
+            encoded,
+        )?;
+        frame.animation_notice = Some(notice);
+        return Ok(frame);
+    }
     let thumbnail = if full_resolution {
         ops::autorot(&raw_source).map_err(|e| e.to_string())?
     } else {
@@ -2591,6 +2754,97 @@ fn decode_image_bytes(
         metadata,
         encoded,
     )
+}
+
+fn animation_size(width: i32, height: i32, frames: usize) -> Option<usize> {
+    if width <= 0 || height <= 0 || frames < 2 {
+        return None;
+    }
+    (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?
+        .checked_mul(frames.checked_add(1)?)
+}
+
+fn animation_delays(encoded: &[u8]) -> Option<Vec<i32>> {
+    // The Rust wrapper only exposes get_as_string(), which truncates long
+    // arrays. Read the typed metadata through libvips' public C API instead.
+    // SAFETY: encoded outlives the image; the borrowed array is copied before
+    // the owned image reference is released. No raw pointer escapes this block.
+    unsafe {
+        use libvips::bindings;
+        let image = bindings::vips_image_new_from_buffer(
+            encoded.as_ptr().cast(),
+            encoded.len() as _,
+            c"".as_ptr(),
+            std::ptr::null::<std::ffi::c_char>(),
+        );
+        if image.is_null() {
+            return None;
+        }
+        let mut values = std::ptr::null_mut();
+        let mut count = 0;
+        let result =
+            bindings::vips_image_get_array_int(image, c"delay".as_ptr(), &mut values, &mut count);
+        let delays = if result == 0 && !values.is_null() && count > 0 {
+            Some(std::slice::from_raw_parts(values, count as usize).to_vec())
+        } else {
+            None
+        };
+        bindings::g_object_unref(image.cast());
+        delays
+    }
+}
+
+fn decode_animation(
+    encoded: &[u8],
+    source: &VipsImage,
+    delays: &[i32],
+    limit: usize,
+) -> Result<Animation, String> {
+    let count = source.get_n_pages() as usize;
+    let size = animation_size(source.get_width(), source.get_height(), count)
+        .ok_or("invalid animation dimensions")?;
+    if size > limit {
+        return Err("animation exceeds the 256 MiB playback limit".into());
+    }
+    let mut total = 0_u64;
+    let frame_ends_ms: Vec<u64> = delays
+        .iter()
+        .map(|delay| {
+            let delay = (*delay).max(0) as u64;
+            // Avoid zero-duration loops and pathological timer rates.
+            total = total.saturating_add(if delay == 0 { 100 } else { delay.max(10) });
+            total
+        })
+        .collect();
+    if frame_ends_ms.len() != count {
+        return Err("animation has incomplete frame timing".into());
+    }
+    let strip = VipsImage::new_from_buffer(encoded, "n=-1").map_err(|e| e.to_string())?;
+    if strip.get_width() != source.get_width()
+        || strip.get_height() as i64 != source.get_height() as i64 * count as i64
+        || source.get_orientation() > 1
+    {
+        return Err("unsupported animation frame layout".into());
+    }
+    let srgb = ops::colourspace(&strip, ops::Interpretation::Srgb).map_err(|e| e.to_string())?;
+    let rgba = ops::cast(&ensure_rgba(srgb)?, ops::BandFormat::Uchar).map_err(|e| e.to_string())?;
+    let pixels = rgba.image_write_to_memory();
+    let expected = source.get_width() as usize * source.get_height() as usize * 4 * count;
+    if pixels.len() != expected {
+        return Err("could not decode all animation frames".into());
+    }
+    let loops = source
+        .get_as_string("loop")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(1);
+    Ok(Animation {
+        pixels: pixels.into(),
+        frame_ends_ms,
+        loops,
+    })
 }
 
 /// Nikon raw files: libvips' tiffload wins the loader sniff (a NEF is a TIFF
@@ -2684,6 +2938,8 @@ fn finish_frame(
         metadata,
         reduced: width != source_width || height != source_height,
         encoded,
+        animation: None,
+        animation_notice: None,
     })
 }
 
@@ -3041,6 +3297,8 @@ mod tests {
             metadata: String::new(),
             reduced: false,
             encoded: Arc::from([]),
+            animation: None,
+            animation_notice: None,
         }
     }
 
@@ -3205,6 +3463,7 @@ mod tests {
 
         let _vips = VipsApp::new("better-image-view-test", false)
             .expect("libvips should initialize for the decode test");
+        check_animation_decoding();
         // Reproduce the malformed palette counts found in маяк.bmp. A 1×1
         // 24-bit BMP has one padded BGR row and no palette.
         let mut bmp = vec![0u8; 58];
@@ -3244,6 +3503,95 @@ mod tests {
             frame.pixels.len(),
             frame.width as usize * frame.height as usize * 4
         );
+    }
+
+    fn check_animation_decoding() {
+        // Synthetic 4×3 red canvas, then transparent green/blue patches. GIF
+        // restores the previous canvas after the green patch (disposal 3).
+        // Expected compositing was generated independently with Pillow; WebP
+        // and JXL are lossless equivalents. TIFF checks the multipage boundary.
+        let expected = include_bytes!("../test/animations/expected.rgba");
+        for name in ["disposal.gif", "timed.webp", "timed.jxl"] {
+            let path = Path::new("test/animations").join(name);
+            for full_resolution in [false, true] {
+                let frame = decode_image(&path, full_resolution).unwrap();
+                let animation = frame.animation.as_ref().expect(name);
+                assert_eq!((frame.width, frame.height), (4, 3));
+                assert!(!frame.reduced);
+                assert_eq!(&*frame.pixels, &expected[..48], "{name} first frame");
+                assert_eq!(&*animation.pixels, expected, "{name} compositing/disposal");
+                assert_eq!(animation.frame_ends_ms, [40, 130, 280], "{name} timing");
+                assert_eq!(animation.loops, 2, "{name} finite loop conversion");
+                assert_eq!(frame.size_bytes(), frame.encoded.len() + 48 + 144 + 24);
+                let source = VipsImage::new_from_buffer(&frame.encoded, "").unwrap();
+                let error =
+                    decode_animation(&frame.encoded, &source, &[40, 90, 150], 100).unwrap_err();
+                assert!(error.contains("playback limit"));
+            }
+        }
+        let still = decode_image(Path::new("test/animations/pages.tiff"), false).unwrap();
+        assert!(
+            !still.is_animation(),
+            "multipage documents must not autoplay"
+        );
+        let long = decode_image(Path::new("test/animations/long.gif"), false).unwrap();
+        let animation = long.animation.as_ref().expect("long GIF must animate");
+        assert_eq!(animation.frame_ends_ms.len(), 1000);
+        assert_eq!(animation.frame_ends_ms[999], 40_000);
+        assert_eq!(animation.loops, 0);
+    }
+
+    #[test]
+    fn animation_timing_respects_delays_loops_and_late_ticks() {
+        let mut animation = Animation {
+            pixels: Arc::from([]),
+            frame_ends_ms: vec![40, 130, 280],
+            loops: 2,
+        };
+        for (ms, expected) in [
+            (0, 0),
+            (39, 0),
+            (40, 1),
+            (129, 1),
+            (130, 2),
+            (279, 2),
+            (280, 0),
+            (410, 2),
+            (560, 2),
+            (100_000, 2),
+        ] {
+            assert_eq!(animation.frame_at(Duration::from_millis(ms)), expected);
+        }
+        animation.loops = 0;
+        assert_eq!(animation.frame_at(Duration::from_millis(560)), 0);
+        assert_eq!(animation.frame_at(Duration::from_millis(280_040)), 1);
+        assert_eq!(animation_size(i32::MAX, i32::MAX, usize::MAX), None);
+        assert_eq!(animation_size(4, 3, 3), Some(192));
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run separately with --ignored"]
+    fn animation_texture_updates_preserve_zoom() {
+        gtk::init().unwrap();
+        let canvas = ImageCanvas::new();
+        let bytes = glib::Bytes::from_owned(vec![255_u8; 4 * 4 * 3 * 2]);
+        let texture = |index: usize| {
+            gdk::MemoryTexture::new(
+                4,
+                3,
+                gdk::MemoryFormat::R8g8b8a8,
+                &glib::Bytes::from_bytes(&bytes, index * 48..(index + 1) * 48),
+                16,
+            )
+        };
+        canvas.set_texture(&texture(0), 4, 3);
+        canvas.imp().zoom.set(3.0);
+        canvas.imp().fit_zoom.set(0.5);
+        let next = texture(1);
+        canvas.update_texture(&next);
+        assert_eq!(canvas.imp().zoom.get(), 3.0);
+        assert_eq!(canvas.imp().fit_zoom.get(), 0.5);
+        assert_eq!(canvas.texture().unwrap(), next.upcast::<gdk::Texture>());
     }
 
     /// A minimal little-endian TIFF mimicking a NEF: IFD0 carries orientation,
