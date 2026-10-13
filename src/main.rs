@@ -19,8 +19,8 @@ const DEFAULT_CACHE_MB: usize = 4096;
 const DEFAULT_DECODE_EDGE: i32 = 8192;
 const MAX_ANIMATION_BYTES: usize = 256 * 1024 * 1024;
 const ZOOM_LEVELS: &[f64] = &[
-    0.125, 0.167, 0.25, 0.333, 0.5, 0.667, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0,
-    10.0, 12.0, 16.0, 20.0, 24.0, 32.0,
+    0.0625, 0.0833, 0.125, 0.167, 0.25, 0.333, 0.5, 0.667, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0,
+    5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0, 32.0,
 ];
 const PRINT_MARGIN_MM: f64 = 12.0;
 #[cfg(any())]
@@ -79,12 +79,17 @@ fn scaled_image_size(image_width: i32, image_height: i32, zoom: f64) -> (f32, f3
     )
 }
 
-fn next_zoom_level(current: f64) -> f64 {
-    ZOOM_LEVELS
+fn next_zoom_level(current: f64, fit: f64) -> Option<f64> {
+    let next = ZOOM_LEVELS
         .iter()
         .copied()
         .find(|level| *level > current + f64::EPSILON)
-        .unwrap_or(*ZOOM_LEVELS.last().expect("zoom levels must not be empty"))
+        .unwrap_or(current);
+    if fit > current + f64::EPSILON && fit <= next {
+        None
+    } else {
+        Some(next)
+    }
 }
 
 fn previous_zoom_level(current: f64, fit: f64) -> Option<f64> {
@@ -92,20 +97,21 @@ fn previous_zoom_level(current: f64, fit: f64) -> Option<f64> {
         .iter()
         .rev()
         .copied()
-        .find(|level| *level < current - f64::EPSILON);
-    match previous {
-        Some(level) if level > fit => Some(level),
-        _ => None,
+        .find(|level| *level < current - f64::EPSILON)
+        .unwrap_or(current.min(fit));
+    if fit < current - f64::EPSILON && fit >= previous {
+        None
+    } else {
+        Some(previous)
     }
 }
 
 fn format_zoom(zoom: f64) -> String {
-    let percentage = zoom * 100.0;
-    if (percentage - percentage.round()).abs() < 0.01 {
-        format!("{percentage:.0}%")
-    } else {
-        format!("{percentage:.1}%")
-    }
+    let percentage = format!("{:.2}", zoom * 100.0);
+    format!(
+        "{}%",
+        percentage.trim_end_matches('0').trim_end_matches('.')
+    )
 }
 
 fn wheel_navigates_images(is_zoomed: bool) -> bool {
@@ -236,14 +242,17 @@ impl ImageCanvas {
             imp.source_height.get(),
         );
         let decoded_scale = imp.decoded_scale.get();
-        let current_source_zoom = current * decoded_scale;
-        let target = if current <= 0.0 {
+        let current_source_zoom = if current <= 0.0 {
             imp.fit_zoom.set(fit);
-            next_zoom_level(fit)
+            fit
         } else {
-            next_zoom_level(current_source_zoom)
+            current * decoded_scale
         };
-        imp.zoom.set(target / decoded_scale);
+        imp.zoom.set(
+            next_zoom_level(current_source_zoom, imp.fit_zoom.get())
+                .map(|level| level / decoded_scale)
+                .unwrap_or(0.0),
+        );
         self.queue_resize();
     }
 
@@ -252,11 +261,21 @@ impl ImageCanvas {
         if imp.texture.borrow().is_none() {
             return;
         }
-        let fit = imp.fit_zoom.get();
         let decoded_scale = imp.decoded_scale.get();
-        let current = imp.zoom.get() * decoded_scale;
+        let current = if imp.zoom.get() <= 0.0 {
+            let fit = default_zoom(
+                self.width(),
+                self.height(),
+                imp.source_width.get(),
+                imp.source_height.get(),
+            );
+            imp.fit_zoom.set(fit);
+            fit
+        } else {
+            imp.zoom.get() * decoded_scale
+        };
         imp.zoom.set(
-            previous_zoom_level(current, fit)
+            previous_zoom_level(current, imp.fit_zoom.get())
                 .map(|level| level / decoded_scale)
                 .unwrap_or(0.0),
         );
@@ -3315,10 +3334,10 @@ mod tests {
 
     #[test]
     fn zoom_steps_use_clean_source_relative_levels() {
-        assert_eq!(next_zoom_level(0.63), 0.667);
-        assert_eq!(next_zoom_level(0.75), 1.0);
-        assert_eq!(next_zoom_level(4.0), 5.0);
-        assert_eq!(next_zoom_level(32.0), 32.0);
+        assert_eq!(next_zoom_level(0.63, 0.63), Some(0.667));
+        assert_eq!(next_zoom_level(0.75, 0.63), Some(1.0));
+        assert_eq!(next_zoom_level(4.0, 0.63), Some(5.0));
+        assert_eq!(next_zoom_level(32.0, 0.63), Some(32.0));
     }
 
     #[test]
@@ -3329,10 +3348,33 @@ mod tests {
     }
 
     #[test]
+    fn zooming_out_continues_below_fit_to_thumbnail_limit() {
+        assert_eq!(previous_zoom_level(1.0, 1.0), Some(0.75));
+        assert_eq!(previous_zoom_level(0.63, 0.63), Some(0.5));
+        assert_eq!(previous_zoom_level(0.0833, 0.63), Some(0.0625));
+        assert_eq!(previous_zoom_level(0.0625, 0.63), Some(0.0625));
+    }
+
+    #[test]
+    fn zooming_in_from_thumbnail_visits_fit() {
+        assert_eq!(next_zoom_level(0.0625, 0.63), Some(0.0833));
+        assert_eq!(next_zoom_level(0.5, 0.63), None);
+        assert_eq!(next_zoom_level(0.75, 1.0), None);
+    }
+
+    #[test]
+    fn fit_below_thumbnail_limit_is_preserved() {
+        assert_eq!(previous_zoom_level(0.03, 0.03), Some(0.03));
+        assert_eq!(next_zoom_level(0.03, 0.03), Some(0.0625));
+        assert_eq!(previous_zoom_level(0.0625, 0.03), None);
+    }
+
+    #[test]
     fn zoom_percentage_keeps_useful_fractional_levels() {
         assert_eq!(format_zoom(1.0), "100%");
         assert_eq!(format_zoom(0.667), "66.7%");
         assert_eq!(format_zoom(0.125), "12.5%");
+        assert_eq!(format_zoom(0.0625), "6.25%");
     }
 
     #[test]

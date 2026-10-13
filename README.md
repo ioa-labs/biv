@@ -53,7 +53,7 @@ Keys and controls:
 - Left / Right at default zoom: previous / next image
 - Arrow keys, Space+drag, or middle-mouse drag while zoomed in: pan the image
 - Home / End: first / last image
-- `+` / `-`: zoom in / out
+- `+` / `-`: zoom in / out (down to 6.25% for a thumbnail preview)
 - `0`: fit image to window
 - `F`: toggle fullscreen (the viewer starts fullscreen)
 - `I`: toggle a minimal filename, resolution, file-type, and current zoom overlay
@@ -76,6 +76,8 @@ to fit the viewport.
 Zoom percentages are relative to the original image dimensions: 100% means one source
 pixel per screen pixel. Zooming uses a ladder of clean percentages and includes the
 exact fit-to-window percentage between its neighboring steps.
+Zooming out continues below fit size down to 6.25%; an image that fits at an even
+smaller percentage keeps that fit size as its lower limit. Press `0` to return to fit.
 
 Quick Edit is non-destructive. Rotation previews use the already decoded display image;
 Save Copy applies the selected rotation and maximum-edge downsize to the full-resolution
